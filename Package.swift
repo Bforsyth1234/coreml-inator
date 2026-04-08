@@ -6,18 +6,18 @@ import PackageDescription
 // It also declares the swift-transformers dependency so Xcode resolves it
 // without any manual configuration.
 let package = Package(
-    name: "CoreMLInator",
+    name: "CoremlInator",
     platforms: [.iOS(.v16)],
     products: [
         .library(
-            name: "CoreMLInator",
+            name: "CoremlInator",
             targets: ["CoreMLPlugin"]
         )
     ],
     dependencies: [
-        // Capacitor's Swift PM bridge — version is resolved by the host app.
+        // Capacitor's Swift PM bridge — 8.0.0..<9.0.0 matches all Capacitor 8.x hosts.
         .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git",
-                 branch: "main"),
+                 from: "8.0.0"),
         // HuggingFace tokenizer library (BPE / SentencePiece).
         .package(url: "https://github.com/huggingface/swift-transformers",
                  from: "1.3.0"),
@@ -28,13 +28,10 @@ let package = Package(
             dependencies: [
                 .product(name: "Capacitor",    package: "capacitor-swift-pm"),
                 .product(name: "Cordova",      package: "capacitor-swift-pm"),
-                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Tokenizers",   package: "swift-transformers"),
             ],
-            // Both Plugin.swift and Plugin.m live here.
-            path: "ios/Plugin",
-            // Exposes the directory as a public headers path so the ObjC
-            // CAP_PLUGIN macro can resolve Capacitor's umbrella header.
-            publicHeadersPath: "."
+            // Plugin.swift lives here (pure Swift, no ObjC).
+            path: "ios/Plugin"
         )
     ]
 )

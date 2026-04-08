@@ -1,7 +1,7 @@
 import Foundation
 import Capacitor
 import CoreML
-import Transformers   // huggingface/swift-transformers — AutoTokenizer, Tokenizer protocol
+import Tokenizers     // huggingface/swift-transformers — AutoTokenizer, Tokenizer protocol
 
 // MARK: - Event name constants
 
@@ -22,8 +22,18 @@ struct GenerationConfig {
 
 // MARK: - CoreMLPlugin
 
+// CAPBridgedPlugin replaces Plugin.m — pure Swift registration,
+// no ObjC file needed, and compatible with SPM (which cannot mix languages).
 @objc(CoreMLPlugin)
-public class CoreMLPlugin: CAPPlugin {
+public class CoreMLPlugin: CAPPlugin, CAPBridgedPlugin {
+
+    public let identifier = "CoreMLPlugin"
+    public let jsName = "CoreMLPlugin"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "loadModel", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "generateText", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "unloadModel", returnType: CAPPluginReturnPromise),
+    ]
 
     // -----------------------------------------------------------------------
     // State
@@ -45,15 +55,15 @@ public class CoreMLPlugin: CAPPlugin {
             call.reject("modelName is required and must not be empty.")
             return
         }
-        // tokenizerFolder defaults to the same name as the model.
         let tokenizerFolderName = call.getString("tokenizerFolder") ?? modelName
 
-        // Task.detached runs on the Swift cooperative thread pool — never blocks
-        // the main thread, and avoids the DispatchQueue/async-await impedance
-        // mismatch since AutoTokenizer.from(modelFolder:) is async throws.
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            await self.unloadModelAsync()
+        // Extract everything from `call` before entering the async boundary
+        // so we never capture the non-Sendable CAPPluginCall across threads.
+        call.keepAlive = true
+
+        Task {
+            // Evict previous model first
+            self.unloadModelSync()
 
             do {
                 // ── 1. Locate the CoreML model ────────────────────────────
@@ -67,64 +77,81 @@ public class CoreMLPlugin: CAPPlugin {
                 }
 
                 // ── 2. Locate the tokenizer folder ────────────────────────
-                // The folder must be added to Xcode as a blue "folder reference"
-                // (not a group) so its contents are copied flat into the bundle.
-                let bundlePath = Bundle.main.bundlePath
-                let tokenizerURL = URL(fileURLWithPath: bundlePath)
-                    .appendingPathComponent(tokenizerFolderName)
-
-                guard FileManager.default.fileExists(atPath:
-                        tokenizerURL.appendingPathComponent("tokenizer.json").path) else {
+                // Check subfolder first (blue folder reference), then bundle root
+                // (yellow group / flat copy).
+                let bundleURL = URL(fileURLWithPath: Bundle.main.bundlePath)
+                let subfolderURL = bundleURL.appendingPathComponent(tokenizerFolderName)
+                let tokenizerURL: URL
+                if FileManager.default.fileExists(atPath:
+                        subfolderURL.appendingPathComponent("tokenizer.json").path) {
+                    tokenizerURL = subfolderURL
+                } else if FileManager.default.fileExists(atPath:
+                        bundleURL.appendingPathComponent("tokenizer.json").path) {
+                    tokenizerURL = bundleURL
+                } else {
                     call.reject(
-                        "Tokenizer files not found at bundle path '\(tokenizerFolderName)/'. " +
-                        "Add tokenizer.json and tokenizer_config.json as a blue folder " +
-                        "reference in Xcode and verify the folder name matches 'tokenizerFolder'."
+                        "Tokenizer files not found in bundle (checked '\(tokenizerFolderName)/' " +
+                        "subfolder and bundle root). Add tokenizer.json and " +
+                        "tokenizer_config.json to your Xcode target."
                     )
                     return
                 }
 
                 // ── 3. Load the tokenizer (async, reads JSON from disk) ───
-                // AutoTokenizer.from(modelFolder:) parses tokenizer_config.json
-                // to determine the correct tokenizer class (BPE, SentencePiece,
-                // WordPiece, etc.) and loads its vocabulary — all offline.
                 let loadedTokenizer = try await AutoTokenizer.from(
                     modelFolder: tokenizerURL
                 )
 
-                // ── 4. Compile + load the CoreML model (sync, blocking) ───
-                // .all routes inference to ANE → GPU → CPU in priority order.
-                // Never use .cpuOnly for LLMs — it is 10-50× slower.
+                // ── 4. Compile + load the CoreML model ────────────────────
                 let mlConfig = MLModelConfiguration()
                 mlConfig.computeUnits = .all
 
                 let compiledURL: URL
                 if modelURL.pathExtension == "mlpackage" {
-                    compiledURL = try MLModel.compileModel(at: modelURL)
+                    compiledURL = try await MLModel.compileModel(at: modelURL)
                 } else {
                     compiledURL = modelURL
                 }
-                let loadedModel = try MLModel(contentsOf: compiledURL,
-                                              configuration: mlConfig)
 
-                // ── 5. Capture state (actor-isolated to avoid data races) ─
-                await MainActor.run {
-                    self.tokenizer  = loadedTokenizer
-                    self.model      = loadedModel
+                // Use the async load() API — the synchronous MLModel(contentsOf:)
+                // initializer crashes with EXC_BAD_ACCESS on large models due to
+                // internal memory-mapping issues during ANE compilation.
+                let loadedModel = try await MLModel.load(
+                    contentsOf: compiledURL,
+                    configuration: mlConfig
+                )
+
+                // ── 5. Store state ────────────────────────────────────────
+                self.tokenizer = loadedTokenizer
+                self.model     = loadedModel
+
+                // Log model I/O so we can diagnose tensor mismatches
+                let inputNames = loadedModel.modelDescription
+                    .inputDescriptionsByName
+                for (name, desc) in inputNames {
+                    print("[CoreML] Input: \(name) → \(desc)")
+                }
+                let outputNames = loadedModel.modelDescription
+                    .outputDescriptionsByName
+                for (name, desc) in outputNames {
+                    print("[CoreML] Output: \(name) → \(desc)")
                 }
 
-                // iOS 18+ stateful API: MLState persists the KV cache so we
-                // feed ONE new token per step rather than the full context window.
+                // Always attempt to create MLState on iOS 18+.
+                // If the model declares key_cache / value_cache inputs, CoreML
+                // REQUIRES an MLState — calling prediction() without it throws
+                // "The input feature for key_cache must be an MLState".
                 if #available(iOS 18.0, *) {
-                    let state = loadedModel.makeState()
-                    await MainActor.run { self.modelState = state }
+                    self.modelState = loadedModel.makeState()
+                    print("[CoreML] Created MLState for stateful inference (iOS 18+)")
                 }
 
-                let desc = loadedModel.modelDescription
+                let modelDesc = loadedModel.modelDescription
                     .metadata[MLModelMetadataKey.description] as? String
 
                 call.resolve([
                     "success": true,
-                    "modelDescription": desc ?? "Model loaded successfully.",
+                    "modelDescription": modelDesc ?? "Model loaded successfully.",
                 ])
 
             } catch {
@@ -156,7 +183,6 @@ public class CoreMLPlugin: CAPPlugin {
             return
         }
 
-        // EOS: explicit JS override → tokenizer's own eosTokenId → fallback 2
         let eosTokenId = call.getInt("eosTokenId")
                       ?? tokenizer.eosTokenId
                       ?? 2
@@ -170,52 +196,66 @@ public class CoreMLPlugin: CAPPlugin {
             eosTokenId:        eosTokenId
         )
 
+        // Capture raw token IDs before crossing async boundary
+        let rawTokenIds = call.getArray("tokenIds", Int.self)
+
         isGenerating = true
         shouldCancelGeneration = false
+        call.keepAlive = true
 
-        // ⚡ THREADING — ALL CoreML matrix math runs here, never on main.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-
-            defer { DispatchQueue.main.async { self.isGenerating = false } }
+        // Task inherits @MainActor but we immediately hop off via the
+        // blocking MLModel.prediction calls which run on the cooperative pool.
+        Task {
+            defer { self.isGenerating = false }
 
             do {
-                // ── Encode prompt ─────────────────────────────────────────
-                // Bypass the Swift tokenizer when JS passes raw token IDs
-                // (e.g. if you are using @huggingface/transformers in a WASM
-                // worker and want bit-for-bit identical tokenization to Python).
                 let promptIds: [Int]
-                if let rawIds = call.getArray("tokenIds", Int.self), !rawIds.isEmpty {
+                if let rawIds = rawTokenIds, !rawIds.isEmpty {
                     promptIds = rawIds
                 } else {
-                    // encode(text:addSpecialTokens:) handles BOS prepending,
-                    // SentencePiece normalisation, BPE merges — all from the
-                    // bundled tokenizer.json.
                     promptIds = tokenizer.encode(text: prompt, addSpecialTokens: true)
                 }
+
+                print("[CoreML] Prompt token count: \(promptIds.count)")
+                print("[CoreML] First 10 token IDs: \(Array(promptIds.prefix(10)))")
+                print("[CoreML] EOS token ID: \(config.eosTokenId)")
+                print("[CoreML] Tokenizer eosTokenId: \(String(describing: tokenizer.eosTokenId))")
 
                 var generatedIds: [Int] = []
                 var fullText = ""
 
+                // Reset KV cache state for each new generation so the model
+                // doesn't carry over context from the previous conversation.
                 let useStatefulAPI: Bool
-                if #available(iOS 18.0, *), self.modelState is MLState {
-                    useStatefulAPI = true
+                if #available(iOS 18.0, *), self.model != nil {
+                    self.modelState = model.makeState()
+                    useStatefulAPI = self.modelState is MLState
                 } else {
                     useStatefulAPI = false
                 }
+                print("[CoreML] Using stateful API: \(useStatefulAPI)")
 
-                for _ in 0..<config.maxNewTokens {
+                for step in 0..<config.maxNewTokens {
                     guard !self.shouldCancelGeneration else { break }
 
-                    let inputIds = useStatefulAPI
-                        ? (generatedIds.isEmpty ? promptIds : [generatedIds.last!])
-                        : promptIds + generatedIds
+                    let inputIds: [Int]
+                    let totalContextLen: Int  // full KV cache length for causal mask
+                    if useStatefulAPI {
+                        inputIds = (generatedIds.isEmpty ? promptIds : [generatedIds.last!])
+                        totalContextLen = promptIds.count + generatedIds.count
+                    } else {
+                        inputIds = promptIds + generatedIds
+                        totalContextLen = inputIds.count
+                    }
 
-                    let inputFeatures = try self.buildInput(tokenIds: inputIds,
-                                                            model: model,
-                                                            isStateful: useStatefulAPI)
+                    let inputFeatures = try self.buildInput(
+                        tokenIds: inputIds,
+                        model: model,
+                        isStateful: useStatefulAPI,
+                        totalContextLen: totalContextLen
+                    )
 
-                    // --- THE INFERENCE CALL ---
+                    // Heavy inference — runs on cooperative thread pool
                     let output: MLFeatureProvider
                     if #available(iOS 18.0, *), let state = self.modelState as? MLState {
                         output = try model.prediction(from: inputFeatures, using: state)
@@ -231,17 +271,12 @@ public class CoreMLPlugin: CAPPlugin {
 
                     generatedIds.append(nextId)
 
-                    // ── Decode single token ───────────────────────────────
-                    // decode(tokens:skipSpecialTokens:) converts one token ID
-                    // to its UTF-8 string fragment.  skipSpecialTokens: true
-                    // suppresses <pad>, <eos>, etc. from appearing in the UI.
                     let tokenText = tokenizer.decode(
                         tokens: [nextId],
                         skipSpecialTokens: true
                     )
                     fullText += tokenText
 
-                    // 🔔 Stream to JavaScript — Capacitor dispatches to main thread.
                     self.notifyListeners(kEventTokenGenerated, data: [
                         "token":   tokenText,
                         "tokenId": nextId,
@@ -271,11 +306,8 @@ public class CoreMLPlugin: CAPPlugin {
 
     @objc func unloadModel(_ call: CAPPluginCall) {
         shouldCancelGeneration = true
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            await self.unloadModelAsync()
-            call.resolve(["success": true])
-        }
+        unloadModelSync()
+        call.resolve(["success": true])
     }
 
     // -----------------------------------------------------------------------
@@ -300,43 +332,117 @@ public class CoreMLPlugin: CAPPlugin {
     /// expected causes a silent shape mismatch at prediction time.
     private func buildInput(tokenIds: [Int],
                             model: MLModel,
-                            isStateful: Bool) throws -> MLFeatureProvider {
+                            isStateful: Bool,
+                            totalContextLen: Int) throws -> MLFeatureProvider {
         let seqLen = tokenIds.count
         let seqShape: [NSNumber] = [1, NSNumber(value: seqLen)]
+        let inputDescs = model.modelDescription.inputDescriptionsByName
 
         // input_ids — [1, seqLen] Int32
         let inputIdsArray = try MLMultiArray(shape: seqShape, dataType: .int32)
-        // ⚠️ BRIDGING QUIRK #4 — Use withUnsafeMutableBytes for bulk writes.
-        // The subscript operator re-validates bounds on every access and is
-        // ~100× slower for large tensors.
-        inputIdsArray.withUnsafeMutableBytes { raw in
+        inputIdsArray.withUnsafeMutableBytes { raw, _ in
             let ptr = raw.bindMemory(to: Int32.self)
             for (i, id) in tokenIds.enumerated() { ptr[i] = Int32(id) }
         }
 
-        // attention_mask — all 1s, same shape
-        let maskArray = try MLMultiArray(shape: seqShape, dataType: .int32)
-        maskArray.withUnsafeMutableBytes { raw in
-            let ptr = raw.bindMemory(to: Int32.self)
-            for i in 0..<seqLen { ptr[i] = 1 }
-        }
-
         var features: [String: MLFeatureValue] = [
-            "input_ids":      MLFeatureValue(multiArray: inputIdsArray),
-            "attention_mask": MLFeatureValue(multiArray: maskArray),
+            "input_ids": MLFeatureValue(multiArray: inputIdsArray),
         ]
 
-        // position_ids — only add when the model explicitly declares this input.
-        // Stateful models usually manage position tracking internally via MLState.
-        if !isStateful,
-           model.modelDescription.inputDescriptionsByName["position_ids"] != nil {
-            let posArray = try MLMultiArray(shape: seqShape, dataType: .int32)
-            posArray.withUnsafeMutableBytes { raw in
+        // attention_mask — all 1s (only if the model declares it)
+        if inputDescs["attention_mask"] != nil {
+            let maskArray = try MLMultiArray(shape: seqShape, dataType: .int32)
+            maskArray.withUnsafeMutableBytes { raw, _ in
                 let ptr = raw.bindMemory(to: Int32.self)
-                for i in 0..<seqLen { ptr[i] = Int32(i) }
+                for i in 0..<seqLen { ptr[i] = 1 }
+            }
+            features["attention_mask"] = MLFeatureValue(multiArray: maskArray)
+        }
+
+        // causal_mask — attention mask for autoregressive generation.
+        //
+        // Shape: [1, 1, seqLen, totalContextLen]
+        //   - seqLen = number of NEW tokens being processed this step
+        //   - totalContextLen = full KV cache length (prompt + generated so far)
+        //
+        // For the prompt step (seqLen=N, totalCtx=N):
+        //   Lower-triangular: row i attends to columns 0..i
+        //
+        // For generation steps (seqLen=1, totalCtx=N+step):
+        //   Single row, all zeros: the new token attends to everything in the cache
+        if let causalDesc = inputDescs["causal_mask"],
+           let constraint = causalDesc.multiArrayConstraint {
+            let rank = constraint.shape.count
+            let dataType = constraint.dataType
+            let keyDim = totalContextLen
+
+            let maskShape: [NSNumber]
+            if rank == 4 {
+                maskShape = [1, 1, NSNumber(value: seqLen), NSNumber(value: keyDim)]
+            } else if rank == 3 {
+                maskShape = [1, NSNumber(value: seqLen), NSNumber(value: keyDim)]
+            } else {
+                maskShape = [NSNumber(value: seqLen), NSNumber(value: keyDim)]
+            }
+
+            let causalArray = try MLMultiArray(shape: maskShape, dataType: dataType)
+            let totalElements = causalArray.count
+
+            if dataType == .float16 {
+                causalArray.withUnsafeMutableBytes { raw, _ in
+                    let ptr = raw.bindMemory(to: UInt16.self)
+                    let maskedVal = Float16(-1e4).bitPattern
+                    let validVal  = Float16(0.0).bitPattern
+                    // Init all to masked
+                    for i in 0..<totalElements { ptr[i] = maskedVal }
+                    // For each query row, unmask the causal window.
+                    // startCol = position of the first token this row can see
+                    //          = totalContextLen - seqLen (everything already in KV cache)
+                    let cacheOffset = totalContextLen - seqLen
+                    for row in 0..<seqLen {
+                        // Attend to all cached tokens (0..<cacheOffset) + up to current position
+                        let lastCol = cacheOffset + row
+                        for col in 0...lastCol {
+                            ptr[row * keyDim + col] = validVal
+                        }
+                    }
+                }
+            } else {
+                causalArray.withUnsafeMutableBytes { raw, _ in
+                    let ptr = raw.bindMemory(to: Float.self)
+                    for i in 0..<totalElements { ptr[i] = -1e9 }
+                    let cacheOffset = totalContextLen - seqLen
+                    for row in 0..<seqLen {
+                        let lastCol = cacheOffset + row
+                        for col in 0...lastCol {
+                            ptr[row * keyDim + col] = 0.0
+                        }
+                    }
+                }
+            }
+            features["causal_mask"] = MLFeatureValue(multiArray: causalArray)
+        }
+
+        // position_ids — only add when the model explicitly declares this input.
+        if inputDescs["position_ids"] != nil {
+            let posArray = try MLMultiArray(shape: seqShape, dataType: .int32)
+            let posOffset = isStateful ? (totalContextLen - seqLen) : 0
+            posArray.withUnsafeMutableBytes { raw, _ in
+                let ptr = raw.bindMemory(to: Int32.self)
+                for i in 0..<seqLen { ptr[i] = Int32(posOffset + i) }
             }
             features["position_ids"] = MLFeatureValue(multiArray: posArray)
         }
+
+        #if DEBUG
+        let provided = Set(features.keys)
+        let required = Set(inputDescs.keys)
+        let missing = required.subtracting(provided)
+            .filter { !$0.contains("cache") && !$0.contains("state") }
+        if !missing.isEmpty {
+            print("[CoreML] ⚠️ Missing input features: \(missing)")
+        }
+        #endif
 
         return try MLDictionaryFeatureProvider(dictionary: features)
     }
@@ -449,14 +555,11 @@ public class CoreMLPlugin: CAPPlugin {
     }
 
     // -----------------------------------------------------------------------
-    // MARK: unloadModelAsync (private)
+    // MARK: unloadModelSync (private)
     // -----------------------------------------------------------------------
 
-    /// Safely releases all model + tokenizer memory.
-    /// Called from Task.detached so @MainActor.run is available to isolate
-    /// the property writes from the generation loop's DispatchQueue thread.
-    @MainActor
-    private func unloadModelAsync() {
+    /// Releases all model + tokenizer memory synchronously.
+    private func unloadModelSync() {
         model      = nil
         modelState = nil   // releases the KV-cache memory block
         tokenizer  = nil   // releases the BPE vocabulary from memory
