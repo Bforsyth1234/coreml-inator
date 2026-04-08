@@ -47,3 +47,11 @@ xcuserdata/
 .env
 .env.local
 .env.*.local
+
+# ── CoreML models — too large for Git ─────────────────────────────────────────
+*.mlmodelc/
+*.mlpackage/
+*.mlmodel
+*.bin
+*.gguf
+Llama3_2_1B/
