@@ -1,0 +1,72 @@
+{
+  "name": "coreml-inator",
+  "version": "0.0.1",
+  "description": "Capacitor plugin for on-device CoreML LLM text generation via the Apple Neural Engine",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "unpkg": "dist/plugin.js",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/plugin.cjs.js",
+      "types": "./dist/esm/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "ios/",
+    "src/"
+  ],
+  "scripts": {
+    "build": "npm run clean && tsc && rollup -c rollup.config.mjs",
+    "clean": "rimraf dist",
+    "lint": "eslint . --ext ts",
+    "fmt": "prettier --write --parser typescript \"{,!(node_modules)/**}/*.ts\"",
+    "verify:ios": "cd ios && pod install"
+  },
+  "keywords": [
+    "capacitor",
+    "plugin",
+    "ios",
+    "coreml",
+    "llm",
+    "ai",
+    "on-device",
+    "machine-learning",
+    "apple-neural-engine",
+    "swift-transformers"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "bugs": {
+    "url": ""
+  },
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    }
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=6.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/core": "^8.3.0",
+    "@rollup/plugin-typescript": "^12.1.2",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "rimraf": "^6.0.0",
+    "rollup": "^4.0.0",
+    "tslib": "^2.8.0",
+    "typescript": "~5.7.0"
+  },
+  "dependencies": {
+    "tslib": "^2.8.0"
+  }
+}

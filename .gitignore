@@ -1,0 +1,49 @@
+# ── Node ─────────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp
+.pnp.js
+
+# ── Build output ──────────────────────────────────────────────────────────────
+dist/
+
+# ── TypeScript ────────────────────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ── iOS / Xcode ───────────────────────────────────────────────────────────────
+# CocoaPods — consumers run `pod install` themselves after `npx cap sync`
+ios/Pods/
+
+# Xcode build products
+ios/build/
+DerivedData/
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Xcode user-specific settings (schemes, breakpoints, etc.)
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+.xcode.env.local
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Environment ───────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local

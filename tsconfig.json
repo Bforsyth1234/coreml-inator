@@ -1,0 +1,51 @@
+{
+  "compilerOptions": {
+    // ── Output ────────────────────────────────────────────────────────────
+    // tsc writes ES-module JS + .d.ts files to dist/esm/.
+    // rollup then reads dist/esm/index.js to produce the CJS and IIFE bundles.
+    "outDir": "./dist/esm",
+    "declaration": true,
+
+    // ── Language level ────────────────────────────────────────────────────
+    // ES2017 gives us native async/await in the output without transpilation.
+    // Raise to ES2020 if you need optional chaining / nullish coalescing in
+    // the compiled output rather than having tsc down-compile them.
+    "target": "ES2017",
+
+    // ── Module format ─────────────────────────────────────────────────────
+    // ES2020 modules are consumed directly by modern bundlers (Vite, webpack 5)
+    // and are what rollup expects as its input.
+    "module": "ES2020",
+
+    // bundler: correct resolution strategy for TypeScript 5+ library code
+    // that will be processed by a downstream bundler rather than Node directly.
+    "moduleResolution": "bundler",
+
+    // ── Library surface ───────────────────────────────────────────────────
+    "lib": ["ES2020", "DOM"],
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    // importHelpers: emit `import { __awaiter } from 'tslib'` instead of
+    // inlining the same helper into every output file — keeps bundle size down.
+    // tslib is listed as a runtime dependency in package.json.
+    "importHelpers": true,
+
+    // ── Interop ───────────────────────────────────────────────────────────
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+
+    // skipLibCheck avoids spurious errors from @capacitor/core's own .d.ts
+    // files when the peer is not yet installed (e.g. in CI before npm install).
+    "skipLibCheck": true,
+
+    // ── Strictness ────────────────────────────────────────────────────────
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
